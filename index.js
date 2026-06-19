@@ -195,11 +195,9 @@ app.post('/api/activate', async (req, res) => {
     const plan = 'basic'; // Shopee bundle always Basic
 
     // Validate inputs
-    if (!order_ref || !email || !plan) {
-      return res.status(400).json({ error: 'Missing required fields.' });
+    if (!order_ref || !email) {
+      return res.status(400).json({ error: 'Order number and email are required.' });
     }
-    // Shopee bundle always gives Basic for 6 months free
-    const plan = 'basic';
     if (!email.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
       return res.status(400).json({ error: 'Invalid email address.' });
     }
