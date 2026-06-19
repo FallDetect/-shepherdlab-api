@@ -3,22 +3,12 @@ const express  = require('express');
 const cors     = require('cors');
 const bcrypt   = require('bcryptjs');
 const { Pool } = require('pg');
-const nodemailer = require('nodemailer');
+// Using Resend API via HTTPS fetch (SMTP is blocked on Render free tier)
 const { nanoid } = require('nanoid');
 
 const app    = express();
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-  connectionTimeout: 10000,
-  greetingTimeout:   10000,
-  socketTimeout:     15000,
-});
+// Resend API key from environment
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
@@ -173,12 +163,22 @@ async function sendWelcomeEmail(email, username, password, plan, isBundle=false)
 </body>
 </html>`;
 
-  return transporter.sendMail({
-    from:    `"FallGuard+ ShepherdLab" <${process.env.SMTP_USER}>`,
-    to:      email,
-    subject: `Your FallGuard+ ${planLabel} credentials`,
-    html,
+  const res = await fetch('https://api.resend.com/emails', {
+    method:  'POST',
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': 'Bearer ' + RESEND_API_KEY,
+    },
+    body: JSON.stringify({
+      from:    'FallGuard+ <noreply@shepherdforms.com>',
+      to:      [email],
+      subject: 'Your FallGuard+ ' + planLabel + ' credentials',
+      html:    html,
+    }),
   });
+  const data = await res.json();
+  if (!res.ok) throw new Error(JSON.stringify(data));
+  return data;
 }
 
 // ── ROUTES ────────────────────────────────────────────────────────────────────
