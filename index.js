@@ -3,11 +3,19 @@ const express  = require('express');
 const cors     = require('cors');
 const bcrypt   = require('bcryptjs');
 const Database = require('better-sqlite3');
-const { Resend } = require('resend');
+const nodemailer = require('nodemailer');
 const { nanoid } = require('nanoid');
 
 const app    = express();
-const resend = new Resend(process.env.RESEND_API_KEY);
+const transporter = nodemailer.createTransport({
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
 const db     = new Database(process.env.DB_PATH || './fallguard.db');
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
@@ -156,8 +164,8 @@ async function sendWelcomeEmail(email, username, password, plan, isBundle=false)
 </body>
 </html>`;
 
-  return resend.emails.send({
-    from:    'FallGuard+ <noreply@shepherdlab.life>',
+  return transporter.sendMail({
+    from:    `"FallGuard+ ShepherdLab" <${process.env.SMTP_USER}>`,
     to:      email,
     subject: `Your FallGuard+ ${planLabel} credentials`,
     html,
