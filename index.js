@@ -2,7 +2,7 @@ require('dotenv').config();
 const express  = require('express');
 const cors     = require('cors');
 const bcrypt   = require('bcryptjs');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const nodemailer = require('nodemailer');
 const { nanoid } = require('nanoid');
 
@@ -16,7 +16,7 @@ const transporter = nodemailer.createTransport({
     pass: process.env.SMTP_PASS,
   },
 });
-const db     = new Database(process.env.DB_PATH || './fallguard.db');
+const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
 app.use(cors({
@@ -30,30 +30,36 @@ app.use(cors({
 app.use(express.json());
 
 // ── DATABASE SETUP ────────────────────────────────────────────────────────────
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    username    TEXT UNIQUE NOT NULL,
-    password    TEXT NOT NULL,
-    email       TEXT UNIQUE NOT NULL,
-    plan        TEXT NOT NULL DEFAULT 'basic',
-    order_ref   TEXT,
-    status      TEXT NOT NULL DEFAULT 'active',
-    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    expires_at  TEXT,
-    notes       TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS activations (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_ref    TEXT NOT NULL,
-    email        TEXT NOT NULL,
-    plan         TEXT NOT NULL,
-    username     TEXT NOT NULL,
-    activated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    ip           TEXT
-  );
-`);
+// DB init runs async on startup
+async function initDB() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id          SERIAL PRIMARY KEY,
+      username    TEXT UNIQUE NOT NULL,
+      password    TEXT NOT NULL,
+      email       TEXT UNIQUE NOT NULL,
+      plan        TEXT NOT NULL DEFAULT 'basic',
+      order_ref   TEXT,
+      status      TEXT NOT NULL DEFAULT 'active',
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      expires_at  TIMESTAMPTZ,
+      notes       TEXT
+    )
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS activations (
+      id           SERIAL PRIMARY KEY,
+      order_ref    TEXT NOT NULL,
+      email        TEXT NOT NULL,
+      plan         TEXT NOT NULL,
+      username     TEXT NOT NULL,
+      activated_at TIMESTAMPTZ DEFAULT NOW(),
+      ip           TEXT
+    )
+  `);
+  console.log('DB ready');
+}
+initDB().catch(console.error);
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 function generateUsername() {
@@ -202,7 +208,8 @@ app.post('/api/activate', async (req, res) => {
     const ref = order_ref.trim().toUpperCase();
 
     // Check if order already activated
-    const existing = db.prepare('SELECT * FROM activations WHERE order_ref = ?').get(ref);
+    const existingRes = await db.query('SELECT * FROM activations WHERE order_ref = $1', [ref]);
+    const existing = existingRes.rows[0];
     if (existing) {
       return res.status(409).json({
         error: 'This order has already been activated.',
@@ -211,7 +218,8 @@ app.post('/api/activate', async (req, res) => {
     }
 
     // Check if email already has an account
-    const emailExists = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase());
+    const emailRes = await db.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+    const emailExists = emailRes.rows[0];
     if (emailExists) {
       return res.status(409).json({
         error: 'An account already exists for this email.',
@@ -225,16 +233,17 @@ app.post('/api/activate', async (req, res) => {
     const hashed      = await bcrypt.hash(rawPassword, 10);
 
     // Store user
-    db.prepare(`
-      INSERT INTO users (username, password, email, plan, order_ref, status, expires_at)
-      VALUES (?, ?, ?, ?, ?, 'active', date('now', '+6 months'))
-    `).run(username, hashed, email.toLowerCase(), plan, ref);
+    await db.query(
+      `INSERT INTO users (username, password, email, plan, order_ref, status, expires_at)
+       VALUES ($1, $2, $3, $4, $5, 'active', NOW() + INTERVAL '6 months')`,
+      [username, hashed, email.toLowerCase(), plan, ref]
+    );
 
     // Log activation
-    db.prepare(`
-      INSERT INTO activations (order_ref, email, plan, username, ip)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(ref, email.toLowerCase(), 'basic-shopee-6mo', username, req.ip);
+    await db.query(
+      'INSERT INTO activations (order_ref, email, plan, username, ip) VALUES ($1, $2, $3, $4, $5)',
+      [ref, email.toLowerCase(), 'basic-shopee-6mo', username, req.ip]
+    );
 
     // Send welcome email
     await sendWelcomeEmail(email, username, rawPassword, 'basic', true); // true = shopee bundle, 6 months
@@ -261,7 +270,8 @@ app.post('/api/verify-login', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Missing credentials.' });
     }
 
-    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username.trim().toLowerCase());
+    const userRes = await db.query('SELECT * FROM users WHERE username = $1', [username.trim().toLowerCase()]);
+    const user = userRes.rows[0];
     if (!user) {
       return res.status(401).json({ ok: false, error: 'Invalid username or password.' });
     }
@@ -289,26 +299,23 @@ app.post('/api/verify-login', async (req, res) => {
 
 // ── GET /api/admin/users ──────────────────────────────────────────────────────
 // Simple admin endpoint — protected by admin key
-app.get('/api/admin/users', (req, res) => {
+app.get('/api/admin/users', async (req, res) => {
   const key = req.headers['x-admin-key'];
   if (key !== process.env.ADMIN_KEY) {
     return res.status(401).json({ error: 'Unauthorised' });
   }
-  const users = db.prepare(`
-    SELECT id, username, email, plan, order_ref, status, created_at, expires_at
-    FROM users ORDER BY created_at DESC
-  `).all();
-  res.json({ count: users.length, users });
+  const result = await db.query('SELECT id, username, email, plan, order_ref, status, created_at, expires_at FROM users ORDER BY created_at DESC');
+  res.json({ count: result.rows.length, users: result.rows });
 });
 
 // GET /api/admin/activations
-app.get('/api/admin/activations', (req, res) => {
+app.get('/api/admin/activations', async (req, res) => {
   const key = req.headers['x-admin-key'];
   if (key !== process.env.ADMIN_KEY) {
     return res.status(401).json({ error: 'Unauthorised' });
   }
-  const rows = db.prepare('SELECT * FROM activations ORDER BY activated_at DESC').all();
-  res.json({ count: rows.length, activations: rows });
+  const result = await db.query('SELECT * FROM activations ORDER BY activated_at DESC');
+  res.json({ count: result.rows.length, activations: result.rows });
 });
 
 // POST /api/admin/create-user (manual account creation for beta testers)
@@ -323,10 +330,10 @@ app.post('/api/admin/create-user', async (req, res) => {
     const rawPassword = generatePassword();
     const hashed      = await bcrypt.hash(rawPassword, 10);
 
-    db.prepare(`
-      INSERT INTO users (username, password, email, plan, order_ref, status, notes)
-      VALUES (?, ?, ?, ?, ?, 'active', ?)
-    `).run(username, hashed, email.toLowerCase(), plan || 'basic', order_ref || 'MANUAL', notes || '');
+    await db.query(
+      `INSERT INTO users (username, password, email, plan, order_ref, status, notes) VALUES ($1,$2,$3,$4,$5,'active',$6)`,
+      [username, hashed, email.toLowerCase(), plan || 'basic', order_ref || 'MANUAL', notes || '']
+    );
 
     if (email && email.includes('@')) {
       await sendWelcomeEmail(email, username, rawPassword, plan || 'basic');
@@ -428,14 +435,16 @@ app.post('/api/stripe/webhook', async (req, res) => {
 
     try {
       // Check if already activated (idempotency)
-      const existing = db.prepare('SELECT * FROM activations WHERE order_ref = ?').get(ref);
+      const existingRes = await db.query('SELECT * FROM activations WHERE order_ref = $1', [ref]);
+    const existing = existingRes.rows[0];
       if (existing) {
         console.log('[webhook] Already activated:', ref);
         return res.json({ received: true });
       }
 
       // Check if email already has account
-      const emailExists = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase());
+      const emailRes = await db.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+    const emailExists = emailRes.rows[0];
       if (emailExists) {
         console.log('[webhook] Email already exists:', email);
         return res.json({ received: true });
@@ -490,10 +499,10 @@ app.post('/api/stripe/webhook', async (req, res) => {
       const customer = await stripe.customers.retrieve(customerId);
       const email    = customer.email;
       if (email) {
-        db.prepare(`
-          UPDATE users SET expires_at = date(expires_at, '+1 month')
-          WHERE email = ? AND status = 'active'
-        `).run(email.toLowerCase());
+        await db.query(
+          "UPDATE users SET expires_at = expires_at + INTERVAL '1 month' WHERE email = $1 AND status = 'active'",
+          [email.toLowerCase()]
+        );
         console.log(`[webhook] Renewed subscription for ${email}`);
       }
     } catch (err) {
@@ -509,8 +518,7 @@ app.post('/api/stripe/webhook', async (req, res) => {
       const customer = await stripe.customers.retrieve(customerId);
       const email    = customer.email;
       if (email) {
-        db.prepare(`UPDATE users SET status = 'cancelled' WHERE email = ?`)
-          .run(email.toLowerCase());
+        await db.query("UPDATE users SET status = 'cancelled' WHERE email = $1", [email.toLowerCase()]);
         console.log(`[webhook] Cancelled subscription for ${email}`);
       }
     } catch (err) {
