@@ -189,8 +189,10 @@ app.get('/health', (req, res) => {
 // Called from download.html when buyer submits order number + email + plan
 app.post('/api/activate', async (req, res) => {
   try {
-    const { order_ref, email } = req.body;
-    const source = 'shopee';
+    // Accept both field names from different form versions
+    const order_ref = req.body.order_ref || req.body.orderNumber || '';
+    const email = req.body.email || '';
+    const plan = 'basic'; // Shopee bundle always Basic
 
     // Validate inputs
     if (!order_ref || !email || !plan) {
