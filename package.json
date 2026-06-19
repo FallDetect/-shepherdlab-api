@@ -1,0 +1,20 @@
+{
+  "name": "shepherdlab-api",
+  "version": "1.0.0",
+  "description": "FallGuard+ activation API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^9.4.3",
+    "resend": "^3.2.0",
+    "nanoid": "^3.3.7",
+    "dotenv": "^16.4.5",
+    "stripe": "^14.21.0"
+  }
+}

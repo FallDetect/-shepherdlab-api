@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: shepherdlab-api
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: RESEND_API_KEY
+        sync: false
+      - key: ADMIN_KEY
+        sync: false
+      - key: APK_URL
+        sync: false
+      - key: DB_PATH
+        value: /data/fallguard.db
+    disk:
+      name: fallguard-db
+      mountPath: /data
+      sizeGB: 1
