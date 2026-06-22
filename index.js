@@ -185,6 +185,30 @@ async function sendWelcomeEmail(email, username, password, plan, isBundle=false)
 
 // Health check
 app.get('/health', (req, res) => {
+
+// Admin: delete user by email (for testing)
+app.get('/api/admin/delete-user', async (req, res) => {
+  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorised' });
+  }
+  const { email } = req.query;
+  if (!email) return res.status(400).json({ error: 'email required' });
+  await db.query('DELETE FROM activations WHERE email = $1', [email.toLowerCase()]);
+  await db.query('DELETE FROM users WHERE email = $1', [email.toLowerCase()]);
+  res.json({ ok: true, deleted: email });
+});
+
+// Admin: view all users as HTML table (easy to read in browser)
+app.get('/api/admin/view', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) {
+    return res.status(401).send('Unauthorised');
+  }
+  const result = await db.query('SELECT id, username, password, email, plan, status, created_at FROM users ORDER BY created_at DESC');
+  const rows = result.rows.map(u =>
+    '<tr><td>'+u.id+'</td><td><b>'+u.username+'</b></td><td><b>'+u.password+'... (hashed)</b></td><td>'+u.email+'</td><td>'+u.plan+'</td><td>'+u.status+'</td><td>'+u.created_at+'</td></tr>'
+  ).join('');
+  res.send('<table border=1 cellpadding=6><tr><th>ID</th><th>Username</th><th>Password</th><th>Email</th><th>Plan</th><th>Status</th><th>Created</th></tr>'+rows+'</table>');
+});
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
@@ -344,6 +368,33 @@ app.post('/api/admin/create-user', async (req, res) => {
 
     res.json({ ok: true, username, password: rawPassword, plan: plan || 'basic' });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// Admin: reset user credentials by email and resend
+app.post('/api/admin/reset-user', async (req, res) => {
+  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorised' });
+  }
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'email required' });
+  try {
+    const newPassword = generatePassword();
+    const hashed = await bcrypt.hash(newPassword, 10);
+    const result = await db.query(
+      'UPDATE users SET password=$1 WHERE email=$2 RETURNING username, plan',
+      [hashed, email.toLowerCase()]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const user = result.rows[0];
+    // Send new credentials
+    sendWelcomeEmail(email, user.username, newPassword, user.plan, true)
+      .then(() => console.log('[reset] Email sent to', email))
+      .catch(err => console.error('[reset] Email failed:', err.message));
+    res.json({ ok: true, username: user.username, newPassword, email });
+  } catch(err) {
     res.status(500).json({ error: err.message });
   }
 });
