@@ -48,6 +48,12 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS sw_visits (
+      id         SERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
   console.log('DB ready');
 }
 initDB().catch(console.error);
@@ -327,6 +333,33 @@ app.post('/api/admin/create-user', async (req, res) => {
 });
 
 // ── START ─────────────────────────────────────────────────────────────────────
+// ── Stay Where ah? visits ────────────────────────────────────────────────────
+app.post('/api/visit', async (req, res) => {
+  try {
+    await db.query('INSERT INTO sw_visits DEFAULT VALUES');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
+
+app.get('/api/admin/stats', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) return res.status(401).json({ ok: false });
+  try {
+    const v  = await db.query('SELECT COUNT(*)::int AS n FROM sw_visits');
+    const vt = await db.query("SELECT COUNT(*)::int AS n FROM sw_visits WHERE created_at >= date_trunc('day', now())");
+    const l  = await db.query('SELECT COUNT(*)::int AS n FROM sw_leads');
+    res.json({
+      ok: true,
+      visits: v.rows[0].n,
+      visits_today: vt.rows[0].n,
+      leads: l.rows[0].n
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
+
 // ── Stay Where ah? report leads ───────────────────────────────────────────────
 app.post('/api/lead', async (req, res) => {
   try {
