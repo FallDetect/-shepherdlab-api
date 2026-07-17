@@ -40,6 +40,14 @@ async function initDB() {
       ip           TEXT
     )
   `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS sw_leads (
+      id         SERIAL PRIMARY KEY,
+      email      TEXT NOT NULL,
+      source     TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
   console.log('DB ready');
 }
 initDB().catch(console.error);
@@ -49,6 +57,9 @@ app.use(cors({
   origin: [
     'https://shepherdlab.life',
     'https://www.shepherdlab.life',
+    'https://staywhere.sg',
+    'https://www.staywhere.sg',
+    'https://staywhere.onrender.com',
     'http://localhost:3000',
     'http://127.0.0.1:5500',
   ]
@@ -316,4 +327,30 @@ app.post('/api/admin/create-user', async (req, res) => {
 });
 
 // ── START ─────────────────────────────────────────────────────────────────────
+// ── Stay Where ah? report leads ───────────────────────────────────────────────
+app.post('/api/lead', async (req, res) => {
+  try {
+    const email  = String((req.body && req.body.email)  || '').trim().toLowerCase();
+    const source = String((req.body && req.body.source) || 'report').slice(0, 40);
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      return res.status(400).json({ ok: false, error: 'invalid email' });
+    }
+    await db.query('INSERT INTO sw_leads (email, source) VALUES ($1, $2)', [email, source]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('lead error', e.message);
+    res.status(500).json({ ok: false });
+  }
+});
+
+app.get('/api/admin/leads', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) return res.status(401).json({ ok: false });
+  try {
+    const r = await db.query('SELECT email, source, created_at FROM sw_leads ORDER BY created_at DESC');
+    res.json({ ok: true, count: r.rows.length, leads: r.rows });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
+
 app.listen(PORT, () => console.log('ShepherdLab API running on port', PORT));
