@@ -67,6 +67,16 @@ async function initDB() {
       created_at  TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+
+  // ── v1.1 migration: Play Billing purchase tracking columns ────────────────
+  // Safe to run repeatedly — ADD COLUMN IF NOT EXISTS is idempotent.
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS purchase_token TEXT`);
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS product_id     TEXT`);
+  await db.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_purchase_token
+    ON users(purchase_token) WHERE purchase_token IS NOT NULL
+  `);
+
   console.log('DB ready');
 }
 initDB().catch(console.error);
@@ -178,6 +188,15 @@ async function sendWelcomeEmail(email, username, password, plan, isBundle) {
   return data;
 }
 
+// ── Telegram admin notification helper ────────────────────────────────────────
+function notifyAdmin(text) {
+  if (!process.env.ADMIN_TELEGRAM_CHAT_ID || !process.env.TELEGRAM_BOT_TOKEN) return;
+  fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: process.env.ADMIN_TELEGRAM_CHAT_ID, text }),
+  }).catch(() => {});
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
@@ -271,227 +290,120 @@ app.post('/api/verify-login', async (req, res) => {
   }
 });
 
-// ── ADMIN: view users ─────────────────────────────────────────────────────────
-app.get('/api/admin/users', async (req, res) => {
-  if (!adminAuth(req, res)) return;
-  const result = await db.query(
-    'SELECT id, username, email, plan, order_ref, status, created_at, expires_at FROM users ORDER BY created_at DESC'
-  );
-  res.json({ count: result.rows.length, users: result.rows });
-});
+// ══════════════════════════════════════════════════════════════════════════════
+// PLAY BILLING SUBSCRIPTION ENDPOINTS (v1.1)
+// ══════════════════════════════════════════════════════════════════════════════
 
-// ── ADMIN: view as HTML table ─────────────────────────────────────────────────
-app.get('/api/admin/view', async (req, res) => {
-  if (!adminAuth(req, res)) return;
-  const result = await db.query(
-    'SELECT id, username, email, plan, status, created_at, expires_at FROM users ORDER BY created_at DESC'
-  );
-  const rows = result.rows.map(u =>
-    `<tr><td>${u.id}</td><td><b>${u.username}</b></td><td>${u.email}</td><td>${u.plan}</td><td>${u.status}</td><td>${u.created_at}</td><td>${u.expires_at||'-'}</td></tr>`
-  ).join('');
-  res.send(`<html><body><h2>Users (${result.rows.length})</h2><table border=1 cellpadding=6 cellspacing=0>
-    <tr><th>ID</th><th>Username</th><th>Email</th><th>Plan</th><th>Status</th><th>Created</th><th>Expires</th></tr>
-    ${rows}</table></body></html>`);
-});
-
-// ── ADMIN: delete user ────────────────────────────────────────────────────────
-app.get('/api/admin/delete-user', async (req, res) => {
-  if (!adminAuth(req, res)) return;
-  const { email } = req.query;
-  if (!email) return res.status(400).json({ error: 'email required' });
-  await db.query('DELETE FROM activations WHERE email = $1', [email.toLowerCase()]);
-  await db.query('DELETE FROM users WHERE email = $1', [email.toLowerCase()]);
-  res.json({ ok: true, deleted: email });
-});
-
-// ── ADMIN: reset user credentials ────────────────────────────────────────────
-app.post('/api/admin/reset-user', async (req, res) => {
-  if (!adminAuth(req, res)) return;
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'email required' });
+// ── POST /api/grant-premium ───────────────────────────────────────────────────
+// Called by the app after a successful Google Play subscription purchase.
+// Idempotent: safe to call multiple times with the same purchase token.
+//
+// Body: {
+//   purchaseToken: string  (required) - from Google Play purchase result
+//   productId:     string  (required) - e.g. 'premium_monthly'
+//   packageName:   string  (optional) - e.g. 'com.caroguard.plusv2'
+//   orderId:       string  (optional) - Google Play order ID, for admin reference
+// }
+//
+// Returns for a NEW purchase:
+//   { ok: true, existing: false, username, password, plan: 'premium', expires_at }
+// Returns for an EXISTING purchase token (renewal / re-verify):
+//   { ok: true, existing: true, username, plan: 'premium', expires_at }
+app.post('/api/grant-premium', async (req, res) => {
   try {
-    const newPassword = generatePassword();
-    const hashed      = await bcrypt.hash(newPassword, 10);
-    const result      = await db.query(
-      'UPDATE users SET password=$1 WHERE email=$2 RETURNING username, plan',
-      [hashed, email.toLowerCase()]
+    const { purchaseToken, productId, packageName, orderId } = req.body || {};
+
+    if (!purchaseToken || !productId) {
+      return res.status(400).json({ error: 'purchaseToken and productId are required.' });
+    }
+
+    // Rolling 35-day window (30-day billing cycle + 5-day grace)
+    const EXTEND_INTERVAL = "35 days";
+
+    // Check if this purchase token has been seen before
+    const existing = await db.query(
+      'SELECT username, plan, expires_at FROM users WHERE purchase_token = $1',
+      [purchaseToken]
     );
-    if (!result.rows[0]) return res.status(404).json({ error: 'User not found' });
-    const user = result.rows[0];
-    sendWelcomeEmail(email, user.username, newPassword, user.plan, true)
-      .then(() => console.log('[reset] Email sent to', email))
-      .catch(err => console.error('[reset] Email failed:', err.message));
-    res.json({ ok: true, username: user.username, newPassword, email });
-  } catch(err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
-// ── ADMIN: create user manually ───────────────────────────────────────────────
-app.post('/api/admin/create-user', async (req, res) => {
-  if (!adminAuth(req, res)) return;
-  const { email, plan, order_ref, notes } = req.body;
-  const months = parseInt(req.body.months) || 6;
-  if (!email) return res.status(400).json({ error: 'email required' });
-  const username    = generateUsername();
-  const rawPassword = generatePassword();
-  const hashed      = await bcrypt.hash(rawPassword, 10);
-  await db.query(
-    `INSERT INTO users (username, password, email, plan, order_ref, status, notes, expires_at)
-     VALUES ($1,$2,$3,$4,$5,'active',$6, NOW() + ($7 || ' months')::interval)`,
-    [username, hashed, email.toLowerCase(), plan||'basic', order_ref||'MANUAL', notes||'', String(months)]
-  );
-  sendWelcomeEmail(email, username, rawPassword, plan||'basic', true)
-    .catch(err => console.error('[create] Email failed:', err.message));
-  res.json({ ok: true, username, password: rawPassword, email });
-});
-
-// ── START ─────────────────────────────────────────────────────────────────────
-// ── Stay Where ah? visits ────────────────────────────────────────────────────
-app.post('/api/visit', async (req, res) => {
-  try {
-    await db.query('INSERT INTO sw_visits DEFAULT VALUES');
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false });
-  }
-});
-
-app.get('/api/admin/stats', async (req, res) => {
-  if (req.query.key !== process.env.ADMIN_KEY) return res.status(401).json({ ok: false });
-  try {
-    const v  = await db.query('SELECT COUNT(*)::int AS n FROM sw_visits');
-    const vt = await db.query("SELECT COUNT(*)::int AS n FROM sw_visits WHERE created_at >= date_trunc('day', now())");
-    const l  = await db.query('SELECT COUNT(*)::int AS n FROM sw_leads');
-    res.json({
-      ok: true,
-      visits: v.rows[0].n,
-      visits_today: vt.rows[0].n,
-      leads: l.rows[0].n
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false });
-  }
-});
-
-// ── Stay Where ah? report leads ───────────────────────────────────────────────
-app.post('/api/lead', async (req, res) => {
-  try {
-    const email  = String((req.body && req.body.email)  || '').trim().toLowerCase();
-    const source = String((req.body && req.body.source) || 'report').slice(0, 40);
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-      return res.status(400).json({ ok: false, error: 'invalid email' });
+    if (existing.rows[0]) {
+      // Repeat call — extend the window, don't rotate credentials
+      const user = existing.rows[0];
+      const updated = await db.query(
+        `UPDATE users
+           SET expires_at = NOW() + INTERVAL '${EXTEND_INTERVAL}',
+               status     = 'active',
+               plan       = 'premium'
+         WHERE purchase_token = $1
+         RETURNING expires_at`,
+        [purchaseToken]
+      );
+      return res.json({
+        ok:         true,
+        existing:   true,
+        username:   user.username,
+        plan:       'premium',
+        expires_at: updated.rows[0].expires_at,
+      });
     }
-    await db.query('INSERT INTO sw_leads (email, source) VALUES ($1, $2)', [email, source]);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('lead error', e.message);
-    res.status(500).json({ ok: false });
-  }
-});
 
-app.get('/api/admin/leads', async (req, res) => {
-  if (req.query.key !== process.env.ADMIN_KEY) return res.status(401).json({ ok: false });
-  try {
-    const r = await db.query('SELECT email, source, created_at FROM sw_leads ORDER BY created_at DESC');
-    res.json({ ok: true, count: r.rows.length, leads: r.rows });
-  } catch (e) {
-    res.status(500).json({ ok: false });
-  }
-});
-
-
-// ══════════════════════════════════════════════════════════════════════════════
-// REDEEM CODES
-// ══════════════════════════════════════════════════════════════════════════════
-function generateCode() {
-  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return code;
-}
-
-// Admin: generate a batch of codes
-app.post('/api/admin/generate-codes', async (req, res) => {
-  if (!adminAuth(req, res)) return;
-  const count  = Math.min(parseInt(req.body.count) || 1, 500);
-  const months = parseInt(req.body.months) || 6;
-  const batch  = req.body.batch || ('batch_' + Date.now());
-  const codes = [];
-  try {
-    for (let i = 0; i < count; i++) {
-      let code, ok = false, tries = 0;
-      while (!ok && tries < 10) {
-        code = generateCode();
-        try {
-          await db.query('INSERT INTO redeem_codes (code, months, batch) VALUES ($1,$2,$3)', [code, months, batch]);
-          ok = true;
-        } catch(e) { tries++; }
-      }
-      if (ok) codes.push(code);
-    }
-    res.json({ ok: true, batch, months, count: codes.length, codes });
-  } catch(err) {
-    console.error('[generate-codes]', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Admin: list codes
-app.get('/api/admin/codes', async (req, res) => {
-  if ((req.headers['x-admin-key'] || req.query.key) !== process.env.ADMIN_KEY) {
-    return res.status(401).json({ error: 'Unauthorised' });
-  }
-  const result = await db.query('SELECT code, months, batch, status, redeemed_by, redeemed_at, created_at FROM redeem_codes ORDER BY created_at DESC LIMIT 1000');
-  const unused   = result.rows.filter(r => r.status === 'unused').length;
-  const redeemed = result.rows.filter(r => r.status === 'redeemed').length;
-  res.json({ total: result.rows.length, unused, redeemed, codes: result.rows });
-});
-
-// App: redeem a code
-app.post('/api/redeem', async (req, res) => {
-  try {
-    const codeRaw = (req.body.code || '').trim().toUpperCase().replace(/[\s\-]/g, '');
-    const email   = (req.body.email || '').trim().toLowerCase();
-    if (!codeRaw) return res.status(400).json({ error: 'Please enter your code.' });
-
-    const codeRes = await db.query('SELECT * FROM redeem_codes WHERE code = $1', [codeRaw]);
-    const codeRow = codeRes.rows[0];
-    if (!codeRow) return res.status(404).json({ error: 'Invalid code. Please check and try again.' });
-    if (codeRow.status === 'redeemed') return res.status(400).json({ error: 'This code has already been used.' });
-
+    // New purchase — create user
     const username    = generateUsername();
     const rawPassword = generatePassword();
     const hashed      = await bcrypt.hash(rawPassword, 10);
-    const userEmail   = email || (username + '@redeem.fallguard');
+    // Synthetic email so we satisfy the UNIQUE NOT NULL constraint.
+    // Never used for delivery — Play subs don't need it.
+    const syntheticEmail = username + '@play.premium';
+    const orderRefTag    = 'PLAY_' + (orderId || purchaseToken.substring(0, 20));
 
-    await db.query(
-      `INSERT INTO users (username, password, email, plan, order_ref, status, expires_at)
-       VALUES ($1,$2,$3,'basic',$4,'active', NOW() + ($5 || ' months')::interval)`,
-      [username, hashed, userEmail, 'CODE_' + codeRaw, String(codeRow.months)]
+    const inserted = await db.query(
+      `INSERT INTO users
+         (username, password, email, plan, order_ref, status, expires_at, purchase_token, product_id)
+       VALUES
+         ($1, $2, $3, 'premium', $4, 'active',
+          NOW() + INTERVAL '${EXTEND_INTERVAL}', $5, $6)
+       RETURNING expires_at`,
+      [username, hashed, syntheticEmail, orderRefTag, purchaseToken, productId]
     );
-    await db.query(
-      `UPDATE redeem_codes SET status='redeemed', redeemed_by=$1, redeemed_at=NOW(), username=$2 WHERE code=$3`,
-      [userEmail, username, codeRaw]
+
+    notifyAdmin(
+      `💳 New Play subscription!\n\n` +
+      `Product: ${productId}\n` +
+      `Username: ${username}\n` +
+      `Order: ${orderId || '(no order ID)'}\n` +
+      `Package: ${packageName || '(no package)'}`
     );
 
-    if (email) {
-      sendWelcomeEmail(email, username, rawPassword, 'basic', true)
-        .catch(err => console.error('[redeem email]', err.message));
-    }
-    if (process.env.ADMIN_TELEGRAM_CHAT_ID && process.env.TELEGRAM_BOT_TOKEN) {
-      const msg = `🎟️ Code redeemed!\n\nCode: ${codeRaw}\nMonths: ${codeRow.months}\nUsername: ${username}\nEmail: ${email || '(none)'}`;
-      fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: process.env.ADMIN_TELEGRAM_CHAT_ID, text: msg }),
-      }).catch(() => {});
-    }
+    res.json({
+      ok:         true,
+      existing:   false,
+      username,
+      password:   rawPassword,
+      plan:       'premium',
+      expires_at: inserted.rows[0].expires_at,
+    });
 
-    res.json({ ok: true, username, password: rawPassword, plan: 'basic', months: codeRow.months });
   } catch(err) {
-    console.error('[redeem]', err);
-    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    console.error('[grant-premium]', err);
+    res.status(500).json({ error: 'Failed to grant premium access. Please try again.' });
   }
 });
 
-app.listen(PORT, () => console.log('ShepherdLab API running on port', PORT));
+// ── POST /api/verify-subscription ─────────────────────────────────────────────
+// Called by the app on launch (for premium users) to check the sub is still valid.
+// Body: { purchaseToken }
+// Returns: { ok: true, active: boolean, expires_at, plan }
+app.post('/api/verify-subscription', async (req, res) => {
+  try {
+    const { purchaseToken } = req.body || {};
+    if (!purchaseToken) {
+      return res.status(400).json({ error: 'purchaseToken required.' });
+    }
+    const result = await db.query(
+      'SELECT username, plan, status, expires_at FROM users WHERE purchase_token = $1',
+      [purchaseToken]
+    );
+    const user = result.rows[0];
+    if (!user) {
+      return res.json({ ok: true, active: false, reason: 'not_found' });
+   
