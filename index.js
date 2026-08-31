@@ -406,4 +406,247 @@ app.post('/api/verify-subscription', async (req, res) => {
     const user = result.rows[0];
     if (!user) {
       return res.json({ ok: true, active: false, reason: 'not_found' });
-   
+    }
+    const active = user.status === 'active'
+                && user.expires_at
+                && new Date(user.expires_at) > new Date();
+    res.json({
+      ok:         true,
+      active,
+      plan:       user.plan,
+      expires_at: user.expires_at,
+      username:   user.username,
+    });
+  } catch(err) {
+    console.error('[verify-subscription]', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ADMIN
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── ADMIN: view users ─────────────────────────────────────────────────────────
+app.get('/api/admin/users', async (req, res) => {
+  if (!adminAuth(req, res)) return;
+  const result = await db.query(
+    'SELECT id, username, email, plan, order_ref, status, created_at, expires_at FROM users ORDER BY created_at DESC'
+  );
+  res.json({ count: result.rows.length, users: result.rows });
+});
+
+// ── ADMIN: view as HTML table ─────────────────────────────────────────────────
+app.get('/api/admin/view', async (req, res) => {
+  if (!adminAuth(req, res)) return;
+  const result = await db.query(
+    'SELECT id, username, email, plan, status, created_at, expires_at FROM users ORDER BY created_at DESC'
+  );
+  const rows = result.rows.map(u =>
+    `<tr><td>${u.id}</td><td><b>${u.username}</b></td><td>${u.email}</td><td>${u.plan}</td><td>${u.status}</td><td>${u.created_at}</td><td>${u.expires_at||'-'}</td></tr>`
+  ).join('');
+  res.send(`<html><body><h2>Users (${result.rows.length})</h2><table border=1 cellpadding=6 cellspacing=0>
+    <tr><th>ID</th><th>Username</th><th>Email</th><th>Plan</th><th>Status</th><th>Created</th><th>Expires</th></tr>
+    ${rows}</table></body></html>`);
+});
+
+// ── ADMIN: delete user ────────────────────────────────────────────────────────
+app.get('/api/admin/delete-user', async (req, res) => {
+  if (!adminAuth(req, res)) return;
+  const { email } = req.query;
+  if (!email) return res.status(400).json({ error: 'email required' });
+  await db.query('DELETE FROM activations WHERE email = $1', [email.toLowerCase()]);
+  await db.query('DELETE FROM users WHERE email = $1', [email.toLowerCase()]);
+  res.json({ ok: true, deleted: email });
+});
+
+// ── ADMIN: reset user credentials ────────────────────────────────────────────
+app.post('/api/admin/reset-user', async (req, res) => {
+  if (!adminAuth(req, res)) return;
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'email required' });
+  try {
+    const newPassword = generatePassword();
+    const hashed      = await bcrypt.hash(newPassword, 10);
+    const result      = await db.query(
+      'UPDATE users SET password=$1 WHERE email=$2 RETURNING username, plan',
+      [hashed, email.toLowerCase()]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'User not found' });
+    const user = result.rows[0];
+    sendWelcomeEmail(email, user.username, newPassword, user.plan, true)
+      .then(() => console.log('[reset] Email sent to', email))
+      .catch(err => console.error('[reset] Email failed:', err.message));
+    res.json({ ok: true, username: user.username, newPassword, email });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── ADMIN: create user manually ───────────────────────────────────────────────
+app.post('/api/admin/create-user', async (req, res) => {
+  if (!adminAuth(req, res)) return;
+  const { email, plan, order_ref, notes } = req.body;
+  const months = parseInt(req.body.months) || 6;
+  if (!email) return res.status(400).json({ error: 'email required' });
+  const username    = generateUsername();
+  const rawPassword = generatePassword();
+  const hashed      = await bcrypt.hash(rawPassword, 10);
+  await db.query(
+    `INSERT INTO users (username, password, email, plan, order_ref, status, notes, expires_at)
+     VALUES ($1,$2,$3,$4,$5,'active',$6, NOW() + ($7 || ' months')::interval)`,
+    [username, hashed, email.toLowerCase(), plan||'basic', order_ref||'MANUAL', notes||'', String(months)]
+  );
+  sendWelcomeEmail(email, username, rawPassword, plan||'basic', true)
+    .catch(err => console.error('[create] Email failed:', err.message));
+  res.json({ ok: true, username, password: rawPassword, email });
+});
+
+// ── Stay Where ah? visits ────────────────────────────────────────────────────
+app.post('/api/visit', async (req, res) => {
+  try {
+    await db.query('INSERT INTO sw_visits DEFAULT VALUES');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
+
+app.get('/api/admin/stats', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) return res.status(401).json({ ok: false });
+  try {
+    const v  = await db.query('SELECT COUNT(*)::int AS n FROM sw_visits');
+    const vt = await db.query("SELECT COUNT(*)::int AS n FROM sw_visits WHERE created_at >= date_trunc('day', now())");
+    const l  = await db.query('SELECT COUNT(*)::int AS n FROM sw_leads');
+    res.json({
+      ok: true,
+      visits: v.rows[0].n,
+      visits_today: vt.rows[0].n,
+      leads: l.rows[0].n
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
+
+// ── Stay Where ah? report leads ───────────────────────────────────────────────
+app.post('/api/lead', async (req, res) => {
+  try {
+    const email  = String((req.body && req.body.email)  || '').trim().toLowerCase();
+    const source = String((req.body && req.body.source) || 'report').slice(0, 40);
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      return res.status(400).json({ ok: false, error: 'invalid email' });
+    }
+    await db.query('INSERT INTO sw_leads (email, source) VALUES ($1, $2)', [email, source]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('lead error', e.message);
+    res.status(500).json({ ok: false });
+  }
+});
+
+app.get('/api/admin/leads', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) return res.status(401).json({ ok: false });
+  try {
+    const r = await db.query('SELECT email, source, created_at FROM sw_leads ORDER BY created_at DESC');
+    res.json({ ok: true, count: r.rows.length, leads: r.rows });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// REDEEM CODES
+// ══════════════════════════════════════════════════════════════════════════════
+function generateCode() {
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+// Admin: generate a batch of codes
+app.post('/api/admin/generate-codes', async (req, res) => {
+  if (!adminAuth(req, res)) return;
+  const count  = Math.min(parseInt(req.body.count) || 1, 500);
+  const months = parseInt(req.body.months) || 6;
+  const batch  = req.body.batch || ('batch_' + Date.now());
+  const codes = [];
+  try {
+    for (let i = 0; i < count; i++) {
+      let code, ok = false, tries = 0;
+      while (!ok && tries < 10) {
+        code = generateCode();
+        try {
+          await db.query('INSERT INTO redeem_codes (code, months, batch) VALUES ($1,$2,$3)', [code, months, batch]);
+          ok = true;
+        } catch(e) { tries++; }
+      }
+      if (ok) codes.push(code);
+    }
+    res.json({ ok: true, batch, months, count: codes.length, codes });
+  } catch(err) {
+    console.error('[generate-codes]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: list codes
+app.get('/api/admin/codes', async (req, res) => {
+  if ((req.headers['x-admin-key'] || req.query.key) !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorised' });
+  }
+  const result = await db.query('SELECT code, months, batch, status, redeemed_by, redeemed_at, created_at FROM redeem_codes ORDER BY created_at DESC LIMIT 1000');
+  const unused   = result.rows.filter(r => r.status === 'unused').length;
+  const redeemed = result.rows.filter(r => r.status === 'redeemed').length;
+  res.json({ total: result.rows.length, unused, redeemed, codes: result.rows });
+});
+
+// App: redeem a code
+app.post('/api/redeem', async (req, res) => {
+  try {
+    const codeRaw = (req.body.code || '').trim().toUpperCase().replace(/[\s\-]/g, '');
+    const email   = (req.body.email || '').trim().toLowerCase();
+    if (!codeRaw) return res.status(400).json({ error: 'Please enter your code.' });
+
+    const codeRes = await db.query('SELECT * FROM redeem_codes WHERE code = $1', [codeRaw]);
+    const codeRow = codeRes.rows[0];
+    if (!codeRow) return res.status(404).json({ error: 'Invalid code. Please check and try again.' });
+    if (codeRow.status === 'redeemed') return res.status(400).json({ error: 'This code has already been used.' });
+
+    const username    = generateUsername();
+    const rawPassword = generatePassword();
+    const hashed      = await bcrypt.hash(rawPassword, 10);
+    const userEmail   = email || (username + '@redeem.fallguard');
+
+    await db.query(
+      `INSERT INTO users (username, password, email, plan, order_ref, status, expires_at)
+       VALUES ($1,$2,$3,'basic',$4,'active', NOW() + ($5 || ' months')::interval)`,
+      [username, hashed, userEmail, 'CODE_' + codeRaw, String(codeRow.months)]
+    );
+    await db.query(
+      `UPDATE redeem_codes SET status='redeemed', redeemed_by=$1, redeemed_at=NOW(), username=$2 WHERE code=$3`,
+      [userEmail, username, codeRaw]
+    );
+
+    if (email) {
+      sendWelcomeEmail(email, username, rawPassword, 'basic', true)
+        .catch(err => console.error('[redeem email]', err.message));
+    }
+    notifyAdmin(
+      `🎟️ Code redeemed!\n\n` +
+      `Code: ${codeRaw}\n` +
+      `Months: ${codeRow.months}\n` +
+      `Username: ${username}\n` +
+      `Email: ${email || '(none)'}`
+    );
+
+    res.json({ ok: true, username, password: rawPassword, plan: 'basic', months: codeRow.months });
+  } catch(err) {
+    console.error('[redeem]', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.listen(PORT, () => console.log('ShepherdLab API running on port', PORT));
