@@ -3,10 +3,16 @@ const express    = require('express');
 const cors       = require('cors');
 const bcrypt     = require('bcryptjs');
 const { Pool }   = require('pg');
-const { nanoid } = require('nanoid');
+const { nanoid, customAlphabet } = require('nanoid');
 
 const app  = express();
 const PORT = process.env.PORT || 10000;
+
+// ── Safe alphabets (avoid visually-ambiguous chars: I l 1 O 0) ────────────────
+const SAFE_LOWER = 'abcdefghjkmnpqrstuvwxyz23456789';
+const SAFE_MIXED = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+const usernameNanoid = customAlphabet(SAFE_LOWER, 6);
+const passwordNanoid = customAlphabet(SAFE_MIXED, 4);
 
 // ── DB ────────────────────────────────────────────────────────────────────────
 const db = new Pool({
@@ -68,8 +74,6 @@ async function initDB() {
     )
   `);
 
-  // ── v1.1 migration: Play Billing purchase tracking columns ────────────────
-  // Safe to run repeatedly — ADD COLUMN IF NOT EXISTS is idempotent.
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS purchase_token TEXT`);
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS product_id     TEXT`);
   await db.query(`
@@ -97,13 +101,17 @@ app.use(express.json());
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 function generateUsername() {
-  return 'user_' + nanoid(6).toLowerCase();
+  // e.g. user_k3xhpq — no confusing chars
+  return 'user_' + usernameNanoid();
 }
 function generatePassword() {
+  // e.g. Safe47-TkPq — no 0/1/O/I/l chars
   const words  = ['Guard','Care','Safe','Watch','Shield','Alert','Protect'];
-  const nums   = Math.floor(10 + Math.random() * 89);
-  const suffix = nanoid(4);
-  return words[Math.floor(Math.random()*words.length)] + nums + '-' + suffix;
+  // 2 digits, each 2-9 (no 0, no 1)
+  const d1 = 2 + Math.floor(Math.random() * 8);
+  const d2 = 2 + Math.floor(Math.random() * 8);
+  const suffix = passwordNanoid();
+  return words[Math.floor(Math.random()*words.length)] + d1 + d2 + '-' + suffix;
 }
 function isValidOrderRef(ref) {
   return /^[A-Z0-9a-z\-_]{6,30}$/.test(ref.trim());
@@ -211,7 +219,6 @@ function notifyAdmin(text) {
 // ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
@@ -234,7 +241,6 @@ app.post('/api/activate', async (req, res) => {
       return res.status(400).json({ error: 'Invalid order number. Please check your Shopee order.' });
     }
 
-    // Check order already used
     const existRes = await db.query(
       'SELECT * FROM activations WHERE order_ref = $1', [order_ref]
     );
@@ -242,7 +248,6 @@ app.post('/api/activate', async (req, res) => {
       return res.status(400).json({ error: 'This order number has already been used.' });
     }
 
-    // Check email already registered
     const emailRes = await db.query(
       'SELECT * FROM users WHERE email = $1', [email]
     );
@@ -250,7 +255,6 @@ app.post('/api/activate', async (req, res) => {
       return res.status(400).json({ error: 'An account already exists for this email.' });
     }
 
-    // Create account
     const username    = generateUsername();
     const rawPassword = generatePassword();
     const hashed      = await bcrypt.hash(rawPassword, 10);
@@ -265,7 +269,6 @@ app.post('/api/activate', async (req, res) => {
       [order_ref, email, 'basic-shopee-6mo', username, req.ip]
     );
 
-    // Send email in background
     sendWelcomeEmail(email, username, rawPassword, plan, true)
       .then(() => console.log('[email] Sent to', email))
       .catch(err => console.error('[email] Failed:', err.message));
@@ -301,32 +304,9 @@ app.post('/api/verify-login', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// PLAY BILLING SUBSCRIPTION ENDPOINTS (v1.1 + v1.2)
+// PLAY BILLING SUBSCRIPTION ENDPOINTS
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── POST /api/grant-premium ───────────────────────────────────────────────────
-// Called by the app after a successful Google Play subscription purchase.
-// Idempotent: safe to call multiple times with the same purchase token.
-//
-// Body: {
-//   purchaseToken: string  (required) - from Google Play purchase result
-//   productId:     string  (required) - e.g. 'premium_monthly'
-//   packageName:   string  (optional) - e.g. 'com.caroguard.plusv2'
-//   orderId:       string  (optional) - Google Play order ID, for admin reference
-//   email:         string  (OPTIONAL, NEW in v1.2) - user's email for credential backup
-// }
-//
-// If email is provided AND valid AND not already taken:
-//   - Uses real email in users table
-//   - Sends welcome email with credentials to that address
-// Else:
-//   - Uses synthetic email (username@play.premium)
-//   - No email sent
-//
-// Returns for a NEW purchase:
-//   { ok: true, existing: false, username, password, plan: 'premium', expires_at, emailSent }
-// Returns for an EXISTING purchase token (renewal / re-verify):
-//   { ok: true, existing: true, username, plan: 'premium', expires_at }
 app.post('/api/grant-premium', async (req, res) => {
   try {
     const { purchaseToken, productId, packageName, orderId, email } = req.body || {};
@@ -335,17 +315,14 @@ app.post('/api/grant-premium', async (req, res) => {
       return res.status(400).json({ error: 'purchaseToken and productId are required.' });
     }
 
-    // Rolling 35-day window (30-day billing cycle + 5-day grace)
     const EXTEND_INTERVAL = "35 days";
 
-    // Check if this purchase token has been seen before
     const existing = await db.query(
       'SELECT username, plan, expires_at FROM users WHERE purchase_token = $1',
       [purchaseToken]
     );
 
     if (existing.rows[0]) {
-      // Repeat call — extend the window, don't rotate credentials
       const user = existing.rows[0];
       const updated = await db.query(
         `UPDATE users
@@ -365,26 +342,21 @@ app.post('/api/grant-premium', async (req, res) => {
       });
     }
 
-    // Validate optional email
     const providedEmail = (email || '').trim().toLowerCase();
     const hasValidEmail = providedEmail && isValidEmail(providedEmail);
 
-    // New purchase — create user
     const username    = generateUsername();
     const rawPassword = generatePassword();
     const hashed      = await bcrypt.hash(rawPassword, 10);
     const syntheticEmail = username + '@play.premium';
     const orderRefTag    = 'PLAY_' + (orderId || purchaseToken.substring(0, 20));
 
-    // Decide which email to store: real email if valid and not taken, else synthetic
     let storedEmail = syntheticEmail;
     if (hasValidEmail) {
       const emailCheck = await db.query('SELECT id FROM users WHERE email = $1', [providedEmail]);
       if (!emailCheck.rows[0]) {
         storedEmail = providedEmail;
       }
-      // else: real email is already in use by another account; store synthetic to avoid
-      // UNIQUE constraint conflict. Still send welcome email to the provided address.
     }
 
     const inserted = await db.query(
@@ -397,7 +369,6 @@ app.post('/api/grant-premium', async (req, res) => {
       [username, hashed, storedEmail, orderRefTag, purchaseToken, productId]
     );
 
-    // Send welcome email to the real address (background, non-blocking)
     let emailSent = false;
     if (hasValidEmail) {
       emailSent = true;
@@ -431,10 +402,6 @@ app.post('/api/grant-premium', async (req, res) => {
   }
 });
 
-// ── POST /api/verify-subscription ─────────────────────────────────────────────
-// Called by the app on launch (for premium users) to check the sub is still valid.
-// Body: { purchaseToken }
-// Returns: { ok: true, active: boolean, expires_at, plan }
 app.post('/api/verify-subscription', async (req, res) => {
   try {
     const { purchaseToken } = req.body || {};
@@ -469,7 +436,6 @@ app.post('/api/verify-subscription', async (req, res) => {
 // ADMIN
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── ADMIN: view users ─────────────────────────────────────────────────────────
 app.get('/api/admin/users', async (req, res) => {
   if (!adminAuth(req, res)) return;
   const result = await db.query(
@@ -478,7 +444,6 @@ app.get('/api/admin/users', async (req, res) => {
   res.json({ count: result.rows.length, users: result.rows });
 });
 
-// ── ADMIN: view as HTML table ─────────────────────────────────────────────────
 app.get('/api/admin/view', async (req, res) => {
   if (!adminAuth(req, res)) return;
   const result = await db.query(
@@ -492,7 +457,6 @@ app.get('/api/admin/view', async (req, res) => {
     ${rows}</table></body></html>`);
 });
 
-// ── ADMIN: delete user ────────────────────────────────────────────────────────
 app.get('/api/admin/delete-user', async (req, res) => {
   if (!adminAuth(req, res)) return;
   const { email } = req.query;
@@ -502,7 +466,6 @@ app.get('/api/admin/delete-user', async (req, res) => {
   res.json({ ok: true, deleted: email });
 });
 
-// ── ADMIN: reset user credentials ────────────────────────────────────────────
 app.post('/api/admin/reset-user', async (req, res) => {
   if (!adminAuth(req, res)) return;
   const { email } = req.body;
@@ -525,7 +488,6 @@ app.post('/api/admin/reset-user', async (req, res) => {
   }
 });
 
-// ── ADMIN: create user manually ───────────────────────────────────────────────
 app.post('/api/admin/create-user', async (req, res) => {
   if (!adminAuth(req, res)) return;
   const { email, plan, order_ref, notes } = req.body;
@@ -571,7 +533,6 @@ app.get('/api/admin/stats', async (req, res) => {
   }
 });
 
-// ── Stay Where ah? report leads ───────────────────────────────────────────────
 app.post('/api/lead', async (req, res) => {
   try {
     const email  = String((req.body && req.body.email)  || '').trim().toLowerCase();
@@ -608,7 +569,6 @@ function generateCode() {
   return code;
 }
 
-// Admin: generate a batch of codes
 app.post('/api/admin/generate-codes', async (req, res) => {
   if (!adminAuth(req, res)) return;
   const count  = Math.min(parseInt(req.body.count) || 1, 500);
@@ -634,7 +594,6 @@ app.post('/api/admin/generate-codes', async (req, res) => {
   }
 });
 
-// Admin: list codes
 app.get('/api/admin/codes', async (req, res) => {
   if ((req.headers['x-admin-key'] || req.query.key) !== process.env.ADMIN_KEY) {
     return res.status(401).json({ error: 'Unauthorised' });
@@ -645,7 +604,6 @@ app.get('/api/admin/codes', async (req, res) => {
   res.json({ total: result.rows.length, unused, redeemed, codes: result.rows });
 });
 
-// App: redeem a code
 app.post('/api/redeem', async (req, res) => {
   try {
     const codeRaw = (req.body.code || '').trim().toUpperCase().replace(/[\s\-]/g, '');
