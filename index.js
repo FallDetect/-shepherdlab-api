@@ -108,6 +108,9 @@ function generatePassword() {
 function isValidOrderRef(ref) {
   return /^[A-Z0-9a-z\-_]{6,30}$/.test(ref.trim());
 }
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
 function adminAuth(req, res) {
   const key = req.headers['x-admin-key'] || req.query.key;
   if (key !== process.env.ADMIN_KEY) {
@@ -119,7 +122,7 @@ function adminAuth(req, res) {
 
 // ── EMAIL via Resend ──────────────────────────────────────────────────────────
 async function sendWelcomeEmail(email, username, password, plan, isBundle) {
-  const planLabel  = plan === 'pro' ? 'Pro' : 'Basic';
+  const planLabel  = plan === 'pro' ? 'Pro' : (plan === 'premium' ? 'Premium' : 'Basic');
   const bundleNote = isBundle
     ? '6 Months Free — Shopee Bundle'
     : planLabel + ' Plan';
@@ -131,10 +134,10 @@ async function sendWelcomeEmail(email, username, password, plan, isBundle) {
   <body style="font-family:Arial,sans-serif;background:#f4f4f4;padding:20px">
   <div style="max-width:560px;margin:0 auto;background:#0D1B2A;border-radius:12px;overflow:hidden">
     <div style="background:#0D1B2A;padding:32px 32px 0">
-      <h1 style="color:#fff;font-size:28px;margin:0">Welcome to FallGuard+ 🛡️</h1>
+      <h1 style="color:#fff;font-size:28px;margin:0">Welcome to ShepherdCare 🛡️</h1>
       <p style="color:#8BA0B4;margin:12px 0 24px">
         ${isBundle
-          ? 'Your Shopee wheelchair purchase includes <strong style="color:#fff">6 months of FallGuard+ Basic — free</strong>. Your account is ready.'
+          ? 'Your Shopee wheelchair purchase includes <strong style="color:#fff">6 months of ShepherdCare Basic — free</strong>. Your account is ready.'
           : 'Your account is ready.'
         }
         Here are your login credentials — save these somewhere safe.
@@ -154,9 +157,16 @@ async function sendWelcomeEmail(email, username, password, plan, isBundle) {
       </table>
     </div>
     <div style="padding:24px 32px">
-      <a href="${process.env.APK_URL || 'https://shepherdlab.life/download/fallguardplus-latest.apk'}"
+      <p style="color:#8BA0B4;font-size:14px;line-height:1.6;margin:0 0 16px">
+        ShepherdCare includes two AI monitoring modes:
+      </p>
+      <ul style="color:#8BA0B4;font-size:13px;line-height:1.7;margin:0 0 16px;padding-left:20px">
+        <li><strong style="color:#fff">Fall Detection</strong> — for wheelchair users, detects falls in real time</li>
+        <li><strong style="color:#fff">Bed Exit Alert</strong> — for fall-risk patients, alerts when patient leaves bed</li>
+      </ul>
+      <a href="${process.env.APK_URL || 'https://play.google.com/store/apps/details?id=com.caroguard.plusv2'}"
          style="display:block;background:#00A896;color:#0D1B2A;text-align:center;padding:14px;border-radius:8px;font-weight:700;font-size:16px;text-decoration:none">
-        ⬇ Download FallGuard+ APK
+        ⬇ Get ShepherdCare on Google Play
       </a>
       <p style="color:#8BA0B4;font-size:13px;text-align:center;margin-top:8px">Android only · Android 9+ · 3GB RAM minimum</p>
     </div>
@@ -177,9 +187,9 @@ async function sendWelcomeEmail(email, username, password, plan, isBundle) {
       'Authorization': 'Bearer ' + process.env.RESEND_API_KEY,
     },
     body: JSON.stringify({
-      from:    'FallGuard+ <noreply@shepherdforms.com>',
+      from:    'ShepherdCare <noreply@shepherdforms.com>',
       to:      [email],
-      subject: 'Your FallGuard+ ' + planLabel + ' credentials',
+      subject: 'Your ShepherdCare ' + planLabel + ' credentials',
       html,
     }),
   });
@@ -216,7 +226,7 @@ app.post('/api/activate', async (req, res) => {
     if (!orderRaw || !email) {
       return res.status(400).json({ error: 'Order number and email are required.' });
     }
-    if (!email.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+    if (!isValidEmail(email)) {
       return res.status(400).json({ error: 'Invalid email address.' });
     }
     const order_ref = orderRaw.replace(/[\s\-]/g, '').toUpperCase();
@@ -291,7 +301,7 @@ app.post('/api/verify-login', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// PLAY BILLING SUBSCRIPTION ENDPOINTS (v1.1)
+// PLAY BILLING SUBSCRIPTION ENDPOINTS (v1.1 + v1.2)
 // ══════════════════════════════════════════════════════════════════════════════
 
 // ── POST /api/grant-premium ───────────────────────────────────────────────────
@@ -303,15 +313,23 @@ app.post('/api/verify-login', async (req, res) => {
 //   productId:     string  (required) - e.g. 'premium_monthly'
 //   packageName:   string  (optional) - e.g. 'com.caroguard.plusv2'
 //   orderId:       string  (optional) - Google Play order ID, for admin reference
+//   email:         string  (OPTIONAL, NEW in v1.2) - user's email for credential backup
 // }
 //
+// If email is provided AND valid AND not already taken:
+//   - Uses real email in users table
+//   - Sends welcome email with credentials to that address
+// Else:
+//   - Uses synthetic email (username@play.premium)
+//   - No email sent
+//
 // Returns for a NEW purchase:
-//   { ok: true, existing: false, username, password, plan: 'premium', expires_at }
+//   { ok: true, existing: false, username, password, plan: 'premium', expires_at, emailSent }
 // Returns for an EXISTING purchase token (renewal / re-verify):
 //   { ok: true, existing: true, username, plan: 'premium', expires_at }
 app.post('/api/grant-premium', async (req, res) => {
   try {
-    const { purchaseToken, productId, packageName, orderId } = req.body || {};
+    const { purchaseToken, productId, packageName, orderId, email } = req.body || {};
 
     if (!purchaseToken || !productId) {
       return res.status(400).json({ error: 'purchaseToken and productId are required.' });
@@ -347,14 +365,27 @@ app.post('/api/grant-premium', async (req, res) => {
       });
     }
 
+    // Validate optional email
+    const providedEmail = (email || '').trim().toLowerCase();
+    const hasValidEmail = providedEmail && isValidEmail(providedEmail);
+
     // New purchase — create user
     const username    = generateUsername();
     const rawPassword = generatePassword();
     const hashed      = await bcrypt.hash(rawPassword, 10);
-    // Synthetic email so we satisfy the UNIQUE NOT NULL constraint.
-    // Never used for delivery — Play subs don't need it.
     const syntheticEmail = username + '@play.premium';
     const orderRefTag    = 'PLAY_' + (orderId || purchaseToken.substring(0, 20));
+
+    // Decide which email to store: real email if valid and not taken, else synthetic
+    let storedEmail = syntheticEmail;
+    if (hasValidEmail) {
+      const emailCheck = await db.query('SELECT id FROM users WHERE email = $1', [providedEmail]);
+      if (!emailCheck.rows[0]) {
+        storedEmail = providedEmail;
+      }
+      // else: real email is already in use by another account; store synthetic to avoid
+      // UNIQUE constraint conflict. Still send welcome email to the provided address.
+    }
 
     const inserted = await db.query(
       `INSERT INTO users
@@ -363,13 +394,23 @@ app.post('/api/grant-premium', async (req, res) => {
          ($1, $2, $3, 'premium', $4, 'active',
           NOW() + INTERVAL '${EXTEND_INTERVAL}', $5, $6)
        RETURNING expires_at`,
-      [username, hashed, syntheticEmail, orderRefTag, purchaseToken, productId]
+      [username, hashed, storedEmail, orderRefTag, purchaseToken, productId]
     );
 
+    // Send welcome email to the real address (background, non-blocking)
+    let emailSent = false;
+    if (hasValidEmail) {
+      emailSent = true;
+      sendWelcomeEmail(providedEmail, username, rawPassword, 'premium', false)
+        .then(() => console.log('[grant-premium] Email sent to', providedEmail))
+        .catch(err => console.error('[grant-premium] Email failed:', err.message));
+    }
+
     notifyAdmin(
-      `💳 New Play subscription!\n\n` +
+      `💳 New ShepherdCare Premium subscription!\n\n` +
       `Product: ${productId}\n` +
       `Username: ${username}\n` +
+      `Email: ${hasValidEmail ? providedEmail : '(not provided)'}\n` +
       `Order: ${orderId || '(no order ID)'}\n` +
       `Package: ${packageName || '(no package)'}`
     );
@@ -381,6 +422,7 @@ app.post('/api/grant-premium', async (req, res) => {
       password:   rawPassword,
       plan:       'premium',
       expires_at: inserted.rows[0].expires_at,
+      emailSent,
     });
 
   } catch(err) {
